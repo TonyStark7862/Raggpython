@@ -6,48 +6,57 @@ import uuid
 from typing import List, Optional, Dict, Any
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.models import Distance
-from fastembed import TextEmbedding
-from fastembed.sparse.bm25 import Bm25
+from fastembed import TextEmbedding, LateInteractionTextEmbedding, SparseTextEmbedding
 import PyPDF2
 
 
 class EnhancedBestRAG:
     """
     EnhancedBestRAG is an improved version of BestRAG that uses local Qdrant persistence
-    and adds reranking functionality for better search results.
+    and implements the hybrid search approach with reranking as shown in the Qdrant documentation.
 
-    It supports dense embeddings, sparse embeddings, and a sophisticated reranking
-    mechanism based on late interaction models for improved retrieval performance.
+    It supports dense embeddings (all-MiniLM-L6-v2), sparse embeddings (bm25),
+    and ColBERT late interaction model for reranking.
 
     Args:
         collection_name (str): The name of the Qdrant collection to use.
         persistence_path (str, optional): Path for local Qdrant storage. Defaults to "./qdrant_data".
-        dense_model_name (str, optional): Model name for dense embeddings. Defaults to "all-MiniLM-L6-v2".
-        late_interaction_model_name (str, optional): Model for reranking. Defaults to "colbertv2.0".
     """
 
     def __init__(self,
                  collection_name: str,
                  persistence_path: str = "./qdrant_data",
-                 dense_model_name: str = "all-MiniLM-L6-v2",
-                 late_interaction_model_name: str = "colbertv2.0"
+                 dense_model_path: str = "sentence-transformers/all-MiniLM-L6-v2",
+                 bm25_model_path: str = "Qdrant/bm25",
+                 colbert_model_path: str = "colbert-ir/colbertv2.0"
                  ):
         self.collection_name = collection_name
         self.persistence_path = persistence_path
         
+        # Store model paths
+        self.dense_model_path = dense_model_path
+        self.bm25_model_path = bm25_model_path
+        self.colbert_model_path = colbert_model_path
+        
+        # Define vector field names (consistent regardless of model path)
+        self.dense_field_name = "dense-vector"
+        self.sparse_field_name = "sparse-vector"
+        self.late_field_name = "late-vector"
+        
         # Initialize local Qdrant client
         self.client = QdrantClient(path=persistence_path)
 
-        # Initialize embedding models
-        self.dense_model = TextEmbedding(dense_model_name)
-        self.late_interaction_model = TextEmbedding(late_interaction_model_name)
-        self.sparse_model = Bm25("Qdrant/bm25")
+        # Initialize embedding models with provided paths
+        self.dense_embedding_model = TextEmbedding(dense_model_path)
+        self.bm25_embedding_model = SparseTextEmbedding(bm25_model_path)
+        self.late_interaction_embedding_model = LateInteractionTextEmbedding(colbert_model_path)
 
         self._create_or_use_collection()
 
     def _create_or_use_collection(self):
         """
         Create a new Qdrant collection if it doesn't exist, or use an existing one.
+        Uses consistent vector field names regardless of model path.
         """
         collections = self.client.get_collections()
         collection_names = [
@@ -57,11 +66,11 @@ class EnhancedBestRAG:
             self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config={
-                    "dense-vector": models.VectorParams(
+                    self.dense_field_name: models.VectorParams(
                         size=384,
                         distance=Distance.COSINE
                     ),
-                    "output-token-embeddings": models.VectorParams(
+                    self.late_field_name: models.VectorParams(
                         size=384,
                         distance=Distance.COSINE,
                         multivector_config=models.MultiVectorConfig(
@@ -69,7 +78,7 @@ class EnhancedBestRAG:
                         )
                     ),
                 },
-                sparse_vectors_config={"sparse": models.SparseVectorParams()}
+                sparse_vectors_config={self.sparse_field_name: models.SparseVectorParams()}
             )
             print(f"Created collection: {self.collection_name}")
         else:
@@ -87,42 +96,6 @@ class EnhancedBestRAG:
             str: The original text.
         """
         return text
-
-    def _get_dense_embedding(self, text: str):
-        """
-        Get the dense embedding for the given text.
-
-        Args:
-            text (str): The text to be embedded.
-
-        Returns:
-            List[float]: The dense embedding vector.
-        """
-        return list(self.dense_model.embed([text]))[0]
-
-    def _get_late_interaction_embedding(self, text: str):
-        """
-        Get the late interaction embedding for the given text.
-
-        Args:
-            text (str): The text to be embedded.
-
-        Returns:
-            List[float]: The late interaction embedding vector.
-        """
-        return list(self.late_interaction_model.embed([text]))[0]
-
-    def _get_sparse_embedding(self, text: str):
-        """
-        Get the sparse embedding for the given text.
-
-        Args:
-            text (str): The text to be embedded.
-
-        Returns:
-            models.SparseVector: The sparse embedding vector.
-        """
-        return next(self.sparse_model.embed(text))
 
     def _extract_pdf_text_per_page(self, pdf_path: str) -> List[str]:
         """
@@ -143,6 +116,7 @@ class EnhancedBestRAG:
                              metadata: Optional[dict] = None):
         """
         Store the embeddings for each page of a PDF file in the Qdrant collection.
+        Implements the approach shown in the documentation images.
 
         Args:
             pdf_path (str): The path to the PDF file.
@@ -150,51 +124,48 @@ class EnhancedBestRAG:
             metadata (Optional[dict]): Additional metadata to store with each embedding.
         """
         texts = self._extract_pdf_text_per_page(pdf_path)
+        points = []
 
         for page_num, text in enumerate(texts):
-            clean_text = self._clean_text(text)
-            dense_embedding = self._get_dense_embedding(clean_text)
-            late_interaction_embedding = self._get_late_interaction_embedding(
-                clean_text)
-            sparse_embedding = self._get_sparse_embedding(clean_text)
+            # No cleaning as requested
+            doc_text = text
+            
+            # Generate all embeddings
+            dense_embedding = list(self.dense_embedding_model.embed([doc_text]))[0]
+            bm25_embedding = next(self.bm25_embedding_model.embed(doc_text))
+            late_interaction_embedding = list(self.late_interaction_embedding_model.embed([doc_text]))[0]
 
-            hybrid_vector = {
-                "dense-vector": dense_embedding,
-                "output-token-embeddings": late_interaction_embedding,
-                "sparse": models.SparseVector(
-                    indices=sparse_embedding.indices,
-                    values=sparse_embedding.values,
-                )
-            }
-
-            # Store both content and all metadata in the payload
-            # This ensures everything is indexed and searchable
+            # Prepare document payload
             payload = {
-                "text": clean_text,
+                "document": doc_text,
                 "page_number": page_num + 1,
-                "pdf_name": pdf_name,
-                "metadata": {}  # Create a nested metadata field
+                "pdf_name": pdf_name
             }
-
+            
             # Add any additional metadata
             if metadata:
-                # Store metadata both at top level (for direct filtering)
-                # and in nested field (for organization)
                 payload.update(metadata)
-                payload["metadata"] = metadata.copy()
 
+            # Create point with consistent vector field names
             point = models.PointStruct(
                 id=str(uuid.uuid4()),
-                vector=hybrid_vector,
+                vector={
+                    self.dense_field_name: dense_embedding,
+                    self.sparse_field_name: bm25_embedding.as_object(),
+                    self.late_field_name: late_interaction_embedding,
+                },
                 payload=payload
             )
+            
+            points.append(point)
 
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=[point]
-            )
-
-            print(f"Stored embedding for page {page_num + 1} of '{pdf_name}' in collection '{self.collection_name}'.")
+        # Batch upsert all points
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points
+        )
+        
+        print(f"Stored embeddings for {len(texts)} pages of '{pdf_name}' in collection '{self.collection_name}'.")
 
     def delete_pdf_embeddings(self, pdf_name: str):
         """
@@ -223,9 +194,13 @@ class EnhancedBestRAG:
 
     def search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         """
-        Search the Qdrant collection for documents that match the given query
-        using a hybrid search approach with reranking.
-
+        Search the Qdrant collection using the hybrid search approach shown in the documentation.
+        
+        This implements the exact approach from the screenshots with:
+        1. Query embedding generation
+        2. Prefetch setup with both dense and sparse vectors
+        3. Final search with reranking using the late interaction model
+        
         Args:
             query (str): The search query.
             limit (int): The maximum number of results to return. Defaults to 10.
@@ -233,38 +208,36 @@ class EnhancedBestRAG:
         Returns:
             List[Dict[str, Any]]: The search results with payload information.
         """
-        clean_query = self._clean_text(query)
-        
-        # Step 1: Generate embeddings for the query
-        dense_vectors = next(self.dense_model.query_embed(clean_query))
-        sparse_vectors = next(self.sparse_model.query_embed(clean_query))
-        late_vectors = next(self.late_interaction_model.query_embed(clean_query))
+        # Step 1: Generate embeddings for the query (exactly as shown in Image 6)
+        dense_vectors = next(self.dense_embedding_model.query_embed(query))
+        sparse_vectors = next(self.bm25_embedding_model.query_embed(query))
+        late_vectors = next(self.late_interaction_embedding_model.query_embed(query))
 
-        # Step 2: Prepare prefetch sub-queries (for hybrid search)
+        # Step 2: Prepare prefetch for hybrid search with consistent field names
         prefetch = [
             models.Prefetch(
                 query=dense_vectors,
-                using="dense-vector",
+                using=self.dense_field_name,
                 limit=20,
             ),
             models.Prefetch(
                 query=models.SparseVector(**sparse_vectors.as_object()),
-                using="bm25",
+                using=self.sparse_field_name,
                 limit=20,
             ),
         ]
 
-        # Step 3: Perform the search with reranking
+        # Step 3: Execute query with reranking using consistent field names
         results = self.client.query_points(
             collection_name=self.collection_name,
             prefetch=prefetch,
             query=late_vectors,
-            using="output-token-embeddings",
+            using=self.late_field_name,
             with_payload=True,
             limit=limit,
         )
         
-        # Step 4: Format and return the results
+        # Format results
         formatted_results = []
         for res in results:
             formatted_results.append({
